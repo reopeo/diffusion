@@ -5,9 +5,9 @@ img_key: image
 img_convert: L
 img_size: 28
 
-epochs: 20
-image_interval: 10
-ckpt_interval: 25
+epochs: 10
+image_interval: 5
+ckpt_interval: 5
 batch_size: 128
 
 model:
