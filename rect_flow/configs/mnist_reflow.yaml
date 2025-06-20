@@ -1,15 +1,14 @@
-output_dir: ../reflow_out
+output_dir: ../out_reflow
 
-reflow_dir: /home/reon/research_ws/diffusion/rect_flow/out
-dataset: dataset
-img_key: png
-img_convert: L
 img_size: 28
+model_channels: 1
 
-epochs: 10
+epochs: 20
 image_interval: 5
 ckpt_interval: 5
 batch_size: 128
+num_workers: 4
+lr: 1e-4
 
 model:
   dim: 32
