@@ -11,7 +11,6 @@ from model import Unet
 eps = 1e-3
 
 @torch.no_grad()
-@torch.no_grad()
 def sample_euler(model, image_size, batch_size, channels, steps, device):
     shape = (batch_size, channels, image_size, image_size)
     x0 = torch.randn(shape, device=device)
