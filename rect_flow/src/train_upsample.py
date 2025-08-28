@@ -74,6 +74,24 @@ class SparseDenseImageDataset(Dataset):
         dense = self.transform(dense_img)
         return {"sparse": sparse, "dense": dense}
 
+class ToMaxPooledTensor:
+    def __init__(self, target_size):
+        self.target_size = target_size
+
+    def __call__(self, img):
+        tensor = T.ToTensor()(img)
+        c, h, w = tensor.shape
+        kh = h // self.target_size
+        kw = w // self.target_size
+        # MaxPool2d expects (N, C, H, W), so add batch dim
+        tensor = tensor.unsqueeze(0)
+        pool = torch.nn.MaxPool2d(kernel_size=(kh, kw), stride=(kh, kw))
+        pooled = pool(tensor)
+        pooled = pooled.squeeze(0)
+        # If pooled size is not exactly target_size, crop or pad as needed
+        pooled = pooled[:, :self.target_size, :self.target_size]
+        return (pooled * 2) - 1
+
 def main():
     parser = ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
@@ -91,11 +109,7 @@ def main():
     ckpt_dir = output_dir / 'ckpt'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
-    transform = T.Compose([
-        T.Resize((config.img_size, config.img_size)),
-        T.ToTensor(),
-        T.Lambda(lambda t: (t * 2) - 1)
-    ])
+    transform = ToMaxPooledTensor(config.img_size)
 
     dataset = SparseDenseImageDataset(
         args.sparse_dir, args.dense_dir, transform, getattr(config, "img_convert", "RGB")
