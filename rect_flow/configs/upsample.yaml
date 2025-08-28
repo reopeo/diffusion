@@ -1,0 +1,14 @@
+output_dir: ../out_upsample_6x6
+
+img_convert: L
+img_size: 300
+
+epochs: 100
+image_interval: 10
+ckpt_interval: 10
+batch_size: 2
+
+model:
+  dim: 32
+  dim_mults: [1, 2, 4]
+  channels: 1
