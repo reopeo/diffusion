@@ -1,0 +1,229 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import transforms as T
+from torchvision.transforms import functional as TF
+from torchvision.utils import make_grid
+from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
+from pathlib import Path
+from scipy import integrate
+from argparse import ArgumentParser
+from omegaconf import OmegaConf
+from PIL import Image
+
+from model import Unet
+
+eps = 1e-3
+
+@torch.no_grad()
+def sample_ode(model, image_size, batch_size=16, channels=1, x_init=None):
+    shape = (batch_size, channels, image_size, image_size)
+    device = next(model.parameters()).device
+
+    b = shape[0]
+    if x_init is not None:
+        x = x_init.to(device)
+    else:
+        x = torch.randn(shape, device=device)
+    
+    def ode_func(t, x):
+        x = torch.tensor(x, device=device, dtype=torch.float).reshape(shape)
+        t = torch.full(size=(b,), fill_value=t, device=device, dtype=torch.float).reshape((b,))
+        v = model(x, t)
+        return v.cpu().numpy().reshape((-1,)).astype(np.float64)
+    
+    res = integrate.solve_ivp(ode_func, (eps, 1.), x.reshape((-1,)).cpu().numpy(), method='RK45')
+    x = torch.tensor(res.y[:, -1], device=device).reshape(shape)
+    return x.clamp(-1, 1)
+
+def random_mask(img, mask_ratio=0.5):
+    # img: Tensor (C,H,W), mask_ratio: 0~1
+    mask = torch.rand_like(img) > mask_ratio
+    return img * mask.float()
+
+def loss_fn(model, x_dense, x_sparse, t):
+    # x_dense: target, x_sparse: input
+    x_0 = x_sparse
+    x_1 = x_dense
+    x_t = t[:, None, None, None] * x_1 + (1 - t[:, None, None, None]) * x_0
+    v = model(x_t, t)
+    loss = F.mse_loss(x_1 - x_0, v)
+    return loss
+
+class SparseDenseImageDataset(Dataset):
+    def __init__(self, sparse_dir, dense_dir, transform=None, img_convert="RGB", pair_transform=None):
+        self.sparse_dir = Path(sparse_dir)
+        self.dense_dir = Path(dense_dir)
+        self.transform = transform            # （片方ずつ用）後方互換
+        self.pair_transform = pair_transform  # （推奨）ペア同時変換
+        self.img_convert = img_convert
+
+        sparse_files = set(f.name for f in self.sparse_dir.glob("*"))
+        dense_files = set(f.name for f in self.dense_dir.glob("*"))
+        self.filenames = sorted(list(sparse_files & dense_files))
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        fname = self.filenames[idx]
+        sparse_img = Image.open(self.sparse_dir / fname).convert(self.img_convert)
+        dense_img  = Image.open(self.dense_dir  / fname).convert(self.img_convert)
+
+        if self.pair_transform is not None:
+            sparse, dense = self.pair_transform(sparse_img, dense_img)
+        else:
+            # 従来通り片方ずつ（ただしパッチ学習したいなら pair_transform を使ってください）
+            sparse = self.transform(sparse_img) if self.transform else T.ToTensor()(sparse_img)
+            dense  = self.transform(dense_img)  if self.transform else T.ToTensor()(dense_img)
+            sparse = (sparse * 2) - 1
+            dense  = (dense  * 2) - 1
+
+        return {"sparse": sparse, "dense": dense}
+
+class PairedRandomPatchToTensor:
+    """
+    同じランダムパッチを (sparse, dense) から切り出して [-1,1] に正規化して返す。
+    画像が小さい場合は reflect pad で拡張してから切り出す。
+    """
+    def __init__(self, patch_size, flip_p=0.5, normalize_to_minus1_1=True):
+        self.ps = int(patch_size)
+        self.flip_p = float(flip_p)
+        self.normalize = normalize_to_minus1_1
+        self.to_tensor = T.ToTensor()
+
+    def _ensure_min_size(self, img, min_h, min_w):
+        # PIL -> Tensor にして reflect pad（PILのpadはreflect非対応なことがある）
+        t = self.to_tensor(img)  # (C,H,W) in [0,1]
+        c, h, w = t.shape
+        pad_h = max(0, min_h - h)
+        pad_w = max(0, min_w - w)
+        if pad_h > 0 or pad_w > 0:
+            # pad=(left,right,top,bottom)
+            left = pad_w // 2
+            right = pad_w - left
+            top = pad_h // 2
+            bottom = pad_h - top
+            t = F.pad(t.unsqueeze(0), (left, right, top, bottom), mode='reflect').squeeze(0)
+        return t  # (C, H', W')
+
+    def __call__(self, sparse_pil, dense_pil):
+        ps = self.ps
+        # 十分なサイズにしてから同じ座標でクロップ
+        ts = self._ensure_min_size(sparse_pil, ps, ps)
+        td = self._ensure_min_size(dense_pil,  ps, ps)
+        _, H, W = ts.shape
+
+        # 同じ(i,j)でクロップ
+        i = np.random.randint(0, H - ps + 1)
+        j = np.random.randint(0, W - ps + 1)
+        ts = ts[:, i:i+ps, j:j+ps]
+        td = td[:, i:i+ps, j:j+ps]
+
+        # 同期フリップ
+        if np.random.rand() < self.flip_p:
+            ts = torch.flip(ts, dims=[2])  # 水平
+            td = torch.flip(td, dims=[2])
+
+        # [-1,1] 正規化
+        if self.normalize:
+            ts = ts * 2 - 1
+            td = td * 2 - 1
+        return ts, td
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--sparse_dir', type=str, required=True)
+    parser.add_argument('--dense_dir', type=str, required=True)
+    args = parser.parse_args()
+
+    config = OmegaConf.load(args.config)
+
+    torch.manual_seed(42)
+
+    output_dir = Path(config.output_dir)
+    img_dir = output_dir / 'images'
+    img_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = output_dir / 'ckpt'
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    
+    pair_transform = PairedRandomPatchToTensor(
+        patch_size=config.img_size,  # ← img_size を「学習パッチサイズ」として使う
+        flip_p=getattr(config, "flip_p", 0.5)
+    )
+
+    dataset = SparseDenseImageDataset(
+        args.sparse_dir, args.dense_dir,
+        transform=None,
+        img_convert=getattr(config, "img_convert", "RGB"),
+        pair_transform=pair_transform,      # ← ここがポイント
+    )
+    dl = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=1)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = Unet(**config.model).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+
+    def loss_fn(model, x_dense, x_sparse, t):
+        # x_dense: target, x_sparse: input
+        x_0 = x_sparse
+        x_1 = x_dense
+        x_t = t[:, None, None, None] * x_1 + (1 - t[:, None, None, None]) * x_0
+        v = model(x_t, t)
+        loss = F.mse_loss(x_1 - x_0, v)
+        return loss
+
+    def handle_batch(batch):
+        batch_size = batch["dense"].shape[0]
+        x_dense = batch["dense"].to(device)
+        x_sparse = batch["sparse"].to(device)
+
+        t = torch.empty(size=(batch_size,), device=device).uniform_(eps, 1)
+        loss = loss_fn(model, x_dense, x_sparse, t)
+        return loss
+
+    # DataLoaderのイテレータを作成
+    dl_iter = iter(dl)
+
+    train_losses = list()
+    for epoch in range(1, config.epochs + 1):
+        losses = list()
+        bar = tqdm(dl, total=len(dl), desc=f'Epoch {epoch}: ')
+        for batch in bar:
+            optimizer.zero_grad()
+            loss = handle_batch(batch)
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            losses.append(loss.item())
+            bar.set_postfix_str(f'Loss: {np.mean(losses):.6f}')
+        train_losses.append(np.mean(losses))
+        if epoch % config.image_interval == 0:
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                dl_iter = iter(dl)
+                batch = next(dl_iter)
+            x_sparse = batch["sparse"][:4]  # 例: 4枚だけ可視化
+            images = sample_ode(
+                model, config.img_size, batch_size=x_sparse.shape[0], channels=config.model.channels, x_init=x_sparse
+            )
+            img = make_grid(images, nrow=2, normalize=True)
+            img = T.ToPILImage()(img)
+            img.save(img_dir / f'epoch_{epoch}.png')
+
+        if epoch % config.ckpt_interval == 0:
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }, ckpt_dir / f'epoch_{epoch:05d}.pth')
+
+
+if __name__ == '__main__':
+    main()
